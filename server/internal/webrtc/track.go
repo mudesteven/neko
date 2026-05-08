@@ -45,7 +45,10 @@ func NewTrack(logger zerolog.Logger, codec codec.RTPCodec, connection *webrtc.Pe
 		logger: logger.With().Str("id", id).Logger(),
 		track:  track,
 		rtcpCh: nil,
-		sample: make(chan types.Sample),
+		// buffer of 1: allows WriteSample to return immediately if sampleReader
+		// is busy with the previous frame. A stalled peer will drop frames
+		// rather than blocking the pipeline dispatcher (which holds listenersMu).
+		sample: make(chan types.Sample, 1),
 	}
 
 	for _, opt := range opts {
@@ -110,7 +113,13 @@ func (t *Track) sampleReader() {
 }
 
 func (t *Track) WriteSample(sample types.Sample) {
-	t.sample <- sample
+	select {
+	case t.sample <- sample:
+	default:
+		// drop frame: peer is too slow or stalled; don't block the pipeline
+		// dispatch goroutine (which holds listenersMu) and starve other viewers
+		t.logger.Trace().Msg("dropping sample: track channel full")
+	}
 }
 
 // --- stream ---
