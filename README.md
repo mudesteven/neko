@@ -164,6 +164,28 @@ Full documentation is available at [neko.m1k1o.net](https://neko.m1k1o.net/). Ke
 - [Frequently Asked Questions](https://neko.m1k1o.net/docs/v3/faq)
 - [Troubleshooting](https://neko.m1k1o.net/docs/v3/troubleshooting)
 
+## Convenience helper: `neko-app` (this fork)
+
+This fork includes a simple helper script at `scripts/neko-app` so you can launch a specific Neko app with one command:
+
+```bash
+./scripts/neko-app chromium
+./scripts/neko-app firefox --port 19080
+./scripts/neko-app status
+```
+
+Install globally:
+
+```bash
+sudo ./scripts/neko-app-install-global.sh
+```
+
+Then use from anywhere:
+
+```bash
+neko-app chromium
+```
+
 ## How to Contribute
 
 Contributions are welcome! Check the [Contributing Guide](https://neko.m1k1o.net/contributing) for details.

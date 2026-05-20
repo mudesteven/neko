@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  neko-app <app> [options]
+  neko-app start <app> [options]
+  neko-app stop [--name NAME]
+  neko-app status [--name NAME]
+  neko-app logs [--name NAME] [--tail N]
+
+Examples:
+  neko-app chromium
+  neko-app start firefox --port 18080 --udp-range 52000-52100
+  neko-app stop --name neko-chromium-18080
+  neko-app status
+
+Options (start):
+  --port N            Host TCP port for web UI (default: 18080)
+  --udp-range A-B     Host UDP range for WebRTC (default: 52000-52100)
+  --name NAME         Container name (default: neko-<app>-<port>)
+  --screen WxH@FPS    Desktop resolution (default: 1920x1080@30)
+  --user-pass PASS    Member/user password (default: neko)
+  --admin-pass PASS   Admin password (default: admin)
+  --nat-ip IP|auto    NAT1TO1 IP advertised to clients (default: auto)
+  --pull              Pull image before start (default)
+  --no-pull           Skip image pull
+  --dry-run           Print docker command without running it
+
+Notes:
+  - Uses image: ghcr.io/m1k1o/neko/<app>:latest
+  - Exposes web on :<port> and UDP EPR range for WebRTC.
+  - Prints LAN/ZeroTier URLs when available.
+EOF
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  if [[ "$ip" =~ ^172\.([0-9]+)\. ]]; then
+    local octet="${BASH_REMATCH[1]}"
+    (( octet >= 16 && octet <= 31 )) && return 0
+  fi
+  return 1
+}
+
+collect_bind_ips() {
+  local -n out=$1
+  out=()
+  while read -r ifname cidr; do
+    local ip="${cidr%%/*}"
+    [[ "$ip" == 127.* ]] && continue
+    if [[ "$ifname" == zt* ]]; then
+      out+=("$ip")
+      continue
+    fi
+    if is_private_ipv4 "$ip" && [[ "$ifname" =~ ^(eth|en|wlan|wl|br) ]]; then
+      out+=("$ip")
+    fi
+  done < <(ip -o -4 addr show up scope global 2>/dev/null | awk '{print $2, $4}')
+
+  if [[ ${#out[@]} -eq 0 ]]; then
+    for ip in $(hostname -I 2>/dev/null || true); do
+      [[ "$ip" == *:* ]] && continue
+      [[ "$ip" == 127.* ]] && continue
+      if is_private_ipv4 "$ip"; then
+        out+=("$ip")
+      fi
+    done
+  fi
+
+  declare -A seen=()
+  local -a uniq=()
+  for ip in "${out[@]}"; do
+    [[ -n "${seen[$ip]:-}" ]] && continue
+    seen[$ip]=1
+    uniq+=("$ip")
+  done
+  out=("${uniq[@]}")
+}
+
+ensure_docker() {
+  if ! have_cmd docker; then
+    cat >&2 <<'EOF'
+ERROR: docker is not installed.
+Install Docker first, then re-run:
+  curl -sSL https://get.docker.com/ | CHANNEL=stable bash
+  sudo apt-get update && sudo apt-get install -y docker-compose-plugin
+EOF
+    exit 1
+  fi
+}
+
+action="start"
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 2
+fi
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  start|stop|status|logs)
+    action="$1"
+    shift
+    ;;
+  *) action="start" ;;
+esac
+
+name=""
+port=18080
+udp_range="52000-52100"
+screen="1920x1080@30"
+user_pass="neko"
+admin_pass="admin"
+nat_ip="auto"
+pull_image=1
+dry_run=0
+tail_lines=200
+app=""
+
+if [[ "$action" == "start" ]]; then
+  if [[ $# -gt 0 && "${1:0:2}" != "--" ]]; then
+    app="$1"
+    shift
+  fi
+  if [[ -z "$app" ]]; then
+    echo "ERROR: missing app name (e.g. chromium, firefox, xfce)" >&2
+    usage
+    exit 2
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="${2:-}"; shift 2 ;;
+      --udp-range) udp_range="${2:-}"; shift 2 ;;
+      --name) name="${2:-}"; shift 2 ;;
+      --screen) screen="${2:-}"; shift 2 ;;
+      --user-pass) user_pass="${2:-}"; shift 2 ;;
+      --admin-pass) admin_pass="${2:-}"; shift 2 ;;
+      --nat-ip) nat_ip="${2:-}"; shift 2 ;;
+      --pull) pull_image=1; shift ;;
+      --no-pull) pull_image=0; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "ERROR: unknown option: $1" >&2; usage; exit 2 ;;
+    esac
+  done
+
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    echo "ERROR: invalid --port: $port" >&2
+    exit 2
+  fi
+  if ! [[ "$udp_range" =~ ^[0-9]+-[0-9]+$ ]]; then
+    echo "ERROR: invalid --udp-range: $udp_range" >&2
+    exit 2
+  fi
+  if [[ -z "$name" ]]; then
+    name="neko-${app}-${port}"
+  fi
+
+  if (( dry_run == 0 )); then
+    ensure_docker
+  fi
+
+  IFS='-' read -r udp_start udp_end <<< "$udp_range"
+  if (( udp_start < 1024 || udp_end > 65535 || udp_start > udp_end )); then
+    echo "ERROR: invalid --udp-range bounds: $udp_range" >&2
+    exit 2
+  fi
+
+  local_ips=()
+  collect_bind_ips local_ips
+
+  if [[ "$nat_ip" == "auto" ]]; then
+    if [[ ${#local_ips[@]} -gt 0 ]]; then
+      nat_ip="${local_ips[0]}"
+    else
+      nat_ip=""
+    fi
+  fi
+
+  image="ghcr.io/m1k1o/neko/${app}:latest"
+
+  docker_cmd=(
+    docker run -d
+    --name "$name"
+    --restart unless-stopped
+    --shm-size 2g
+    -p "${port}:8080"
+    -p "${udp_start}-${udp_end}:${udp_start}-${udp_end}/udp"
+    -e "NEKO_DESKTOP_SCREEN=${screen}"
+    -e "NEKO_MEMBER_MULTIUSER_USER_PASSWORD=${user_pass}"
+    -e "NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=${admin_pass}"
+    -e "NEKO_WEBRTC_EPR=${udp_start}-${udp_end}"
+    -e "NEKO_WEBRTC_ICELITE=1"
+  )
+
+  if [[ -n "$nat_ip" ]]; then
+    docker_cmd+=(-e "NEKO_WEBRTC_NAT1TO1=${nat_ip}" -e "NEKO_NAT1TO1=${nat_ip}")
+  fi
+
+  docker_cmd+=("$image")
+
+  echo "Container: $name"
+  echo "Image: $image"
+  echo "Web port: $port"
+  echo "UDP range: $udp_range"
+  [[ -n "$nat_ip" ]] && echo "NAT1TO1: $nat_ip"
+
+  if (( dry_run == 1 )); then
+    printf 'dry-run command: '
+    printf '%q ' "${docker_cmd[@]}"
+    echo
+  else
+    if (( pull_image == 1 )); then
+      docker pull "$image"
+    fi
+    if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
+      docker rm -f "$name" >/dev/null
+    fi
+    "${docker_cmd[@]}" >/dev/null
+  fi
+
+  echo "URLs:"
+  if [[ ${#local_ips[@]} -gt 0 ]]; then
+    for ip in "${local_ips[@]}"; do
+      echo "  http://${ip}:${port}/"
+    done
+  else
+    echo "  http://127.0.0.1:${port}/"
+  fi
+  exit 0
+fi
+
+ensure_docker
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) name="${2:-}"; shift 2 ;;
+    --tail) tail_lines="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "$name" ]]; then
+  name="$(docker ps -a --format '{{.Names}}' | grep '^neko-' | head -n1 || true)"
+fi
+
+if [[ "$action" != "status" && -z "$name" ]]; then
+  echo "ERROR: no container selected. Use --name <container>." >&2
+  exit 1
+fi
+
+case "$action" in
+  stop)
+    docker rm -f "$name"
+    ;;
+  status)
+    docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | awk 'NR==1 || /^neko-/'
+    ;;
+  logs)
+    docker logs --tail "$tail_lines" "$name"
+    ;;
+esac
