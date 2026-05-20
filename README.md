@@ -164,14 +164,24 @@ Full documentation is available at [neko.m1k1o.net](https://neko.m1k1o.net/). Ke
 - [Frequently Asked Questions](https://neko.m1k1o.net/docs/v3/faq)
 - [Troubleshooting](https://neko.m1k1o.net/docs/v3/troubleshooting)
 
-## Convenience helper: `neko-app` (this fork)
+## Convenience helpers (this fork)
 
-This fork includes a simple helper script at `scripts/neko-app` so you can launch a specific Neko app with one command:
+This fork includes two helper scripts:
+
+- `scripts/neko-app` -> Docker-based launcher (official/recommended deployment path)
+- `scripts/neko-app-host` -> host-native launcher (no Docker; runs Xvfb + openbox + app + neko binary)
+
+Examples:
 
 ```bash
+# Docker path
 ./scripts/neko-app chromium
-./scripts/neko-app firefox --port 19080
 ./scripts/neko-app status
+
+# Host-native path (no Docker)
+./scripts/neko-app-host firefox
+./scripts/neko-app-host chromium --port 19080
+./scripts/neko-app-host status
 ```
 
 Install globally:
@@ -184,6 +194,7 @@ Then use from anywhere:
 
 ```bash
 neko-app chromium
+neko-app-host firefox
 ```
 
 ## How to Contribute
