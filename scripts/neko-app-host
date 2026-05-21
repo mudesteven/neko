@@ -258,6 +258,20 @@ setup_snap_pulse_shim() {
   SNAP_PULSE_SHIMS+=("$socket_path")
 }
 
+setup_default_pulse_shim() {
+  local state_dir="$1"
+  local default_native="/run/user/$(id -u)/pulse/native"
+
+  mkdir -p "$(dirname "$default_native")" 2>/dev/null || return 0
+
+  # Only replace symlinks we can safely restore on stop.
+  if [[ -L "$default_native" ]]; then
+    DEFAULT_PULSE_NATIVE="$default_native"
+    DEFAULT_PULSE_NATIVE_PREV="$(readlink "$default_native" 2>/dev/null || true)"
+    ln -sfn "$state_dir/pulseaudio.socket" "$default_native"
+  fi
+}
+
 if [[ "$action" == "start" ]]; then
   if [[ $# -gt 0 && "${1:0:2}" != "--" ]]; then
     app="$1"
@@ -532,6 +546,14 @@ EOF
     PULSE_PID=$!
 
     SNAP_PULSE_SHIMS=()
+    DEFAULT_PULSE_NATIVE=""
+    DEFAULT_PULSE_NATIVE_PREV=""
+
+    # Many WSL/browser paths resolve pulse via /run/user/<uid>/pulse/native.
+    # Override that symlink for this runtime so apps that ignore PULSE_SERVER
+    # still land on the runtime pulseaudio socket.
+    setup_default_pulse_shim "$state_dir"
+
     # Snap browsers often ignore inherited PULSE_SERVER and look for
     # per-snap pulse sockets under /run/user/<uid>/snap.<name>/common/pulse/native.
     # Point known browser snap sockets at this runtime's pulseaudio socket.
@@ -596,6 +618,8 @@ STATE_DIR=$state_dir
 X_PID=$X_PID
 PULSE_PID=$PULSE_PID
 SNAP_PULSE_SHIMS='${SNAP_PULSE_SHIMS[*]:-}'
+DEFAULT_PULSE_NATIVE=${DEFAULT_PULSE_NATIVE}
+DEFAULT_PULSE_NATIVE_PREV='${DEFAULT_PULSE_NATIVE_PREV}'
 OPENBOX_PID=$OPENBOX_PID
 APP_PID=$APP_PID
 NEKO_PID=$NEKO_PID
@@ -660,6 +684,16 @@ case "$action" in
         kill -9 "$p" 2>/dev/null || true
       fi
     done
+    if [[ -n "${DEFAULT_PULSE_NATIVE:-}" && -L "${DEFAULT_PULSE_NATIVE}" ]]; then
+      current_target="$(readlink "${DEFAULT_PULSE_NATIVE}" 2>/dev/null || true)"
+      if [[ "$current_target" == *"/runs/host/"*"/pulseaudio.socket" ]]; then
+        if [[ -n "${DEFAULT_PULSE_NATIVE_PREV:-}" ]]; then
+          ln -sfn "${DEFAULT_PULSE_NATIVE_PREV}" "${DEFAULT_PULSE_NATIVE}" 2>/dev/null || true
+        else
+          rm -f "${DEFAULT_PULSE_NATIVE}" 2>/dev/null || true
+        fi
+      fi
+    fi
     for shim in ${SNAP_PULSE_SHIMS:-}; do
       if [[ -L "$shim" ]]; then
         target="$(readlink "$shim" 2>/dev/null || true)"
@@ -676,6 +710,7 @@ case "$action" in
     [[ -n "${DISPLAY:-}" ]] && echo "Display requested: ${DISPLAY}"
     [[ -n "${RUNTIME_DISPLAY:-}" ]] && echo "Display runtime: ${RUNTIME_DISPLAY}"
     [[ -n "${X11_TRANSPORT:-}" ]] && echo "X11 transport: ${X11_TRANSPORT}"
+    [[ -n "${DEFAULT_PULSE_NATIVE:-}" ]] && echo "Default pulse shim: ${DEFAULT_PULSE_NATIVE} -> ${DEFAULT_PULSE_NATIVE_PREV:-unknown}"
     [[ -n "${SNAP_PULSE_SHIMS:-}" ]] && echo "Snap pulse shims: ${SNAP_PULSE_SHIMS}"
     for label in X_PID PULSE_PID OPENBOX_PID APP_PID NEKO_PID; do
       pid="${!label:-}"
