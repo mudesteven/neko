@@ -84,20 +84,27 @@ collect_bind_ips() {
   out=("${uniq[@]}")
 }
 
-ensure_x11_socket_dir() {
+pick_x11_transport() {
   local d="/tmp/.X11-unix"
   mkdir -p "$d" 2>/dev/null || true
   chmod 1777 "$d" 2>/dev/null || true
-  if [[ ! -w "$d" ]]; then
-    cat >&2 <<'EOF'
-ERROR: /tmp/.X11-unix is not writable by current user.
-Run once:
-  sudo mkdir -p /tmp/.X11-unix
-  sudo chmod 1777 /tmp/.X11-unix
-Then retry.
-EOF
-    exit 1
+
+  # Preferred: UNIX socket transport (fast, default)
+  if [[ -w "$d" ]]; then
+    X11_TRANSPORT="unix"
+    X11_DISPLAY_PREFIX=""
+    X11_LISTEN_ARGS=("-nolisten" "tcp")
+    return 0
   fi
+
+  # WSLg often mounts /tmp/.X11-unix read-only; fallback to localhost TCP.
+  X11_TRANSPORT="tcp"
+  X11_DISPLAY_PREFIX="127.0.0.1"
+  X11_LISTEN_ARGS=("-listen" "tcp" "-nolisten" "unix")
+  cat >&2 <<'EOF'
+WARN: /tmp/.X11-unix is not writable (likely read-only in this environment).
+Falling back to TCP X11 transport on 127.0.0.1.
+EOF
 }
 
 pick_display() {
@@ -308,11 +315,19 @@ if [[ "$action" == "start" ]]; then
     app_cmd="$(default_app_command "$app")"
   fi
 
+  runtime_display="$display"
+  X11_TRANSPORT="unix"
+  X11_DISPLAY_PREFIX=""
+  X11_LISTEN_ARGS=("-nolisten" "tcp")
+  pick_x11_transport
+  if [[ "$X11_TRANSPORT" == "tcp" ]]; then
+    runtime_display="$X11_DISPLAY_PREFIX${display}"
+  fi
+
   if (( dry_run == 0 )); then
     require_cmd Xvfb
     require_cmd openbox
     require_cmd pulseaudio
-    ensure_x11_socket_dir
     if [[ ! -x "$neko_bin" ]]; then
       cat >&2 <<EOF
 ERROR: missing neko binary: $neko_bin
@@ -367,18 +382,18 @@ EOF
   echo "App: $app"
   echo "App command: $app_cmd"
   echo "State dir: $state_dir"
-  echo "Display: $display"
+  echo "Display: $display (runtime: $runtime_display, transport: $X11_TRANSPORT)"
   echo "Web port: $port"
   echo "UDP range: $udp_range"
   [[ -n "$nat_ip" ]] && echo "NAT1TO1: $nat_ip"
 
   if (( dry_run == 1 )); then
     echo "dry-run commands:"
-    echo "  Xvfb $display -screen 0 1920x1080x24 -nolisten tcp"
+    echo "  Xvfb $display -screen 0 1920x1080x24 ${X11_LISTEN_ARGS[*]}"
     echo "  pulseaudio -nF $pulse_conf"
     echo "  openbox"
     echo "  $app_cmd"
-    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $display --capture.video.display $display --desktop.screen $screen --desktop.input.enabled false --webrtc.epr $udp_start-$udp_end"
+    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled false --webrtc.epr $udp_start-$udp_end"
   else
     if [[ -f "$pid_file" ]]; then
       # shellcheck disable=SC1090
@@ -390,27 +405,27 @@ EOF
       fi
     fi
 
-    DISPLAY="$display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" \
-      Xvfb "$display" -screen 0 1920x1080x24 -nolisten tcp >"$x_log" 2>&1 &
+    DISPLAY="$runtime_display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" \
+      Xvfb "$display" -screen 0 1920x1080x24 "${X11_LISTEN_ARGS[@]}" >"$x_log" 2>&1 &
     X_PID=$!
 
     mkdir -p "$state_dir/runtime"
     chmod 700 "$state_dir/runtime"
 
-    DISPLAY="$display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" \
+    DISPLAY="$runtime_display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" \
       pulseaudio -nF "$pulse_conf" --exit-idle-time=-1 >"$pulse_log" 2>&1 &
     PULSE_PID=$!
 
-    DISPLAY="$display" HOME="$HOME" USER="$USER" \
+    DISPLAY="$runtime_display" HOME="$HOME" USER="$USER" \
       openbox >"$ob_log" 2>&1 &
     OPENBOX_PID=$!
 
-    DISPLAY="$display" HOME="$HOME" USER="$USER" \
+    DISPLAY="$runtime_display" HOME="$HOME" USER="$USER" \
       bash -lc "$app_cmd" >"$app_log" 2>&1 &
     APP_PID=$!
 
     NEKO_ENV=(
-      "DISPLAY=$display"
+      "DISPLAY=$runtime_display"
       "HOME=$HOME"
       "USER=$USER"
       "PULSE_SERVER=unix:$state_dir/pulseaudio.socket"
@@ -421,8 +436,8 @@ EOF
       "NEKO_WEBRTC_ICELITE=1"
       "NEKO_DESKTOP_SCREEN=$screen"
       "NEKO_DESKTOP_INPUT_ENABLED=false"
-      "NEKO_DESKTOP_DISPLAY=$display"
-      "NEKO_CAPTURE_VIDEO_DISPLAY=$display"
+      "NEKO_DESKTOP_DISPLAY=$runtime_display"
+      "NEKO_CAPTURE_VIDEO_DISPLAY=$runtime_display"
     )
     if [[ -n "$nat_ip" ]]; then
       NEKO_ENV+=("NEKO_WEBRTC_NAT1TO1=$nat_ip")
@@ -431,8 +446,8 @@ EOF
     env "${NEKO_ENV[@]}" "$neko_bin" serve \
       --server.bind "0.0.0.0:$port" \
       --server.static "$static_dir" \
-      --desktop.display "$display" \
-      --capture.video.display "$display" \
+      --desktop.display "$runtime_display" \
+      --capture.video.display "$runtime_display" \
       --desktop.screen "$screen" \
       --desktop.input.enabled false \
       --webrtc.epr "$udp_start-$udp_end" >"$neko_log" 2>&1 &
@@ -442,6 +457,8 @@ EOF
 NAME=$name
 APP=$app
 DISPLAY=$display
+RUNTIME_DISPLAY=$runtime_display
+X11_TRANSPORT=$X11_TRANSPORT
 PORT=$port
 UDP_RANGE=$udp_range
 STATE_DIR=$state_dir
@@ -516,6 +533,9 @@ case "$action" in
   status)
     echo "Name: ${NAME:-$name}"
     echo "State dir: $state_dir"
+    [[ -n "${DISPLAY:-}" ]] && echo "Display requested: ${DISPLAY}"
+    [[ -n "${RUNTIME_DISPLAY:-}" ]] && echo "Display runtime: ${RUNTIME_DISPLAY}"
+    [[ -n "${X11_TRANSPORT:-}" ]] && echo "X11 transport: ${X11_TRANSPORT}"
     for label in X_PID PULSE_PID OPENBOX_PID APP_PID NEKO_PID; do
       pid="${!label:-}"
       if pid_is_alive "$pid"; then
