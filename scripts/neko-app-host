@@ -242,6 +242,22 @@ dry_run=0
 tail_lines=200
 app=""
 
+setup_snap_pulse_shim() {
+  local state_dir="$1"
+  local snap_name="$2"
+  local socket_path="/run/user/$(id -u)/${snap_name}/common/pulse/native"
+
+  mkdir -p "$(dirname "$socket_path")" 2>/dev/null || return 0
+
+  # Do not replace non-symlink files/sockets.
+  if [[ -e "$socket_path" && ! -L "$socket_path" ]]; then
+    return 0
+  fi
+
+  ln -sfn "$state_dir/pulseaudio.socket" "$socket_path"
+  SNAP_PULSE_SHIMS+=("$socket_path")
+}
+
 if [[ "$action" == "start" ]]; then
   if [[ $# -gt 0 && "${1:0:2}" != "--" ]]; then
     app="$1"
@@ -515,6 +531,13 @@ EOF
       pulseaudio -nF "$pulse_conf" --exit-idle-time=-1 >"$pulse_log" 2>&1 &
     PULSE_PID=$!
 
+    SNAP_PULSE_SHIMS=()
+    # Snap browsers often ignore inherited PULSE_SERVER and look for
+    # per-snap pulse sockets under /run/user/<uid>/snap.<name>/common/pulse/native.
+    # Point known browser snap sockets at this runtime's pulseaudio socket.
+    setup_snap_pulse_shim "$state_dir" "snap.chromium"
+    setup_snap_pulse_shim "$state_dir" "snap.firefox"
+
     OPENBOX_PID=""
     if [[ "$mode" == "app" ]]; then
       DISPLAY="$runtime_display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" USER="$USER" \
@@ -572,6 +595,7 @@ UDP_RANGE=$udp_range
 STATE_DIR=$state_dir
 X_PID=$X_PID
 PULSE_PID=$PULSE_PID
+SNAP_PULSE_SHIMS='${SNAP_PULSE_SHIMS[*]:-}'
 OPENBOX_PID=$OPENBOX_PID
 APP_PID=$APP_PID
 NEKO_PID=$NEKO_PID
@@ -636,6 +660,14 @@ case "$action" in
         kill -9 "$p" 2>/dev/null || true
       fi
     done
+    for shim in ${SNAP_PULSE_SHIMS:-}; do
+      if [[ -L "$shim" ]]; then
+        target="$(readlink "$shim" 2>/dev/null || true)"
+        if [[ "$target" == *"/runs/host/"*"/pulseaudio.socket" ]]; then
+          rm -f "$shim" 2>/dev/null || true
+        fi
+      fi
+    done
     echo "Stopped runtime: $name"
     ;;
   status)
@@ -644,6 +676,7 @@ case "$action" in
     [[ -n "${DISPLAY:-}" ]] && echo "Display requested: ${DISPLAY}"
     [[ -n "${RUNTIME_DISPLAY:-}" ]] && echo "Display runtime: ${RUNTIME_DISPLAY}"
     [[ -n "${X11_TRANSPORT:-}" ]] && echo "X11 transport: ${X11_TRANSPORT}"
+    [[ -n "${SNAP_PULSE_SHIMS:-}" ]] && echo "Snap pulse shims: ${SNAP_PULSE_SHIMS}"
     for label in X_PID PULSE_PID OPENBOX_PID APP_PID NEKO_PID; do
       pid="${!label:-}"
       if pid_is_alive "$pid"; then
