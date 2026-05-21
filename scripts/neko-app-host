@@ -26,13 +26,16 @@ Options (start):
   --nat-ip IP|auto|off NAT1TO1 IP advertised to clients (default: off)
   --user-pass PASS     Member/user password (default: neko)
   --admin-pass PASS    Admin password (default: admin)
+  --mode MODE          app|desktop (default: app)
+  --desktop-env ENV    desktop session for --mode desktop: xfce|openbox (default: xfce)
   --app-cmd CMD        Override app launch command (advanced)
   --isolated-profile   Force isolated browser profile under runs/host/<name>/browser-profile
   --dry-run            Print planned commands only
 
 Notes:
   - Host-native mode (no Docker).
-  - Requires host deps: Xvfb, openbox, pulseaudio, and built neko binary.
+  - Requires host deps: Xvfb, pulseaudio, and built neko binary.
+  - app mode additionally uses openbox; desktop mode launches the chosen desktop session.
   - Expected neko binary path: ./server/bin/neko (or --neko-bin in script edits).
 EOF
 }
@@ -201,6 +204,7 @@ default_app_command() {
     vivaldi) echo "/usr/bin/vivaldi --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer" ;;
     opera) echo "/usr/bin/opera --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer" ;;
     xfce) echo "/usr/bin/startxfce4" ;;
+    openbox) echo "/usr/bin/openbox-session" ;;
     kde) echo "/usr/bin/startplasma-x11" ;;
     vlc) echo "/usr/bin/vlc" ;;
     *) echo "$app" ;;
@@ -230,6 +234,8 @@ display="auto"
 nat_ip="off"
 user_pass="neko"
 admin_pass="admin"
+mode="app"
+desktop_env="xfce"
 app_cmd_override=""
 isolated_profile=0
 dry_run=0
@@ -257,6 +263,8 @@ if [[ "$action" == "start" ]]; then
       --nat-ip) nat_ip="${2:-}"; shift 2 ;;
       --user-pass) user_pass="${2:-}"; shift 2 ;;
       --admin-pass) admin_pass="${2:-}"; shift 2 ;;
+      --mode) mode="${2:-}"; shift 2 ;;
+      --desktop-env) desktop_env="${2:-}"; shift 2 ;;
       --app-cmd) app_cmd_override="${2:-}"; shift 2 ;;
       --isolated-profile) isolated_profile=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -288,6 +296,29 @@ if [[ "$action" == "start" ]]; then
   if (( udp_start < 1024 || udp_end > 65535 || udp_start > udp_end )); then
     echo "ERROR: invalid --udp-range bounds: $udp_range" >&2
     exit 2
+  fi
+
+  if [[ "$mode" != "app" && "$mode" != "desktop" ]]; then
+    echo "ERROR: invalid --mode: $mode (use app or desktop)" >&2
+    exit 2
+  fi
+
+  # Convenience: `neko-app-host xfce` should behave like desktop mode.
+  if [[ "$mode" == "app" ]]; then
+    case "$app" in
+      xfce|openbox)
+        mode="desktop"
+        desktop_env="$app"
+        ;;
+    esac
+  fi
+
+  if [[ "$mode" == "desktop" ]]; then
+    if [[ "$desktop_env" != "xfce" && "$desktop_env" != "openbox" ]]; then
+      echo "ERROR: invalid --desktop-env: $desktop_env (use xfce or openbox)" >&2
+      exit 2
+    fi
+    app="desktop-$desktop_env"
   fi
 
   root="$(repo_root)"
@@ -325,6 +356,8 @@ if [[ "$action" == "start" ]]; then
 
   if [[ -n "$app_cmd_override" ]]; then
     app_cmd="$app_cmd_override"
+  elif [[ "$mode" == "desktop" ]]; then
+    app_cmd="$(default_app_command "$desktop_env")"
   else
     app_cmd="$(default_app_command "$app")"
   fi
@@ -366,8 +399,21 @@ EOF
 
   if (( dry_run == 0 )); then
     require_cmd Xvfb
-    require_cmd openbox
     require_cmd pulseaudio
+    if [[ "$mode" == "app" ]]; then
+      require_cmd openbox
+    elif [[ -z "$app_cmd_override" ]]; then
+      case "$desktop_env" in
+        xfce)
+          require_cmd startxfce4
+          ;;
+        openbox)
+          if ! have_cmd openbox-session; then
+            require_cmd openbox
+          fi
+          ;;
+      esac
+    fi
     if [[ ! -x "$neko_bin" ]]; then
       cat >&2 <<EOF
 ERROR: missing neko binary: $neko_bin
@@ -420,6 +466,10 @@ EOF
   echo "Repo: $root"
   echo "Neko: $neko_bin"
   echo "App: $app"
+  echo "Mode: $mode"
+  if [[ "$mode" == "desktop" ]]; then
+    echo "Desktop env: $desktop_env"
+  fi
   if (( browser_family == 1 )); then
     if (( isolated_profile == 1 )); then
       echo "Browser profile mode: isolated"
@@ -438,7 +488,9 @@ EOF
     echo "dry-run commands:"
     echo "  Xvfb $display -screen 0 1920x1080x24 ${X11_LISTEN_ARGS[*]}"
     echo "  pulseaudio -nF $pulse_conf"
-    echo "  openbox"
+    if [[ "$mode" == "app" ]]; then
+      echo "  openbox"
+    fi
     echo "  $app_cmd"
     echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled=false --session.cookie.enabled=false --webrtc.ip_retrieval_url '' --webrtc.epr $udp_start-$udp_end"
   else
@@ -463,11 +515,16 @@ EOF
       pulseaudio -nF "$pulse_conf" --exit-idle-time=-1 >"$pulse_log" 2>&1 &
     PULSE_PID=$!
 
-    DISPLAY="$runtime_display" HOME="$HOME" USER="$USER" \
-      openbox >"$ob_log" 2>&1 &
-    OPENBOX_PID=$!
+    OPENBOX_PID=""
+    if [[ "$mode" == "app" ]]; then
+      DISPLAY="$runtime_display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" USER="$USER" \
+      PULSE_SERVER="unix:$state_dir/pulseaudio.socket" \
+        openbox >"$ob_log" 2>&1 &
+      OPENBOX_PID=$!
+    fi
 
-    DISPLAY="$runtime_display" HOME="$HOME" USER="$USER" \
+    DISPLAY="$runtime_display" XDG_RUNTIME_DIR="$state_dir/runtime" HOME="$HOME" USER="$USER" \
+    PULSE_SERVER="unix:$state_dir/pulseaudio.socket" \
       bash -lc "$app_cmd" >"$app_log" 2>&1 &
     APP_PID=$!
 
