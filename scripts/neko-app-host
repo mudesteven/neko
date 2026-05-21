@@ -27,6 +27,7 @@ Options (start):
   --user-pass PASS     Member/user password (default: neko)
   --admin-pass PASS    Admin password (default: admin)
   --app-cmd CMD        Override app launch command (advanced)
+  --isolated-profile   Force isolated browser profile under runs/host/<name>/browser-profile
   --dry-run            Print planned commands only
 
 Notes:
@@ -230,6 +231,7 @@ nat_ip="off"
 user_pass="neko"
 admin_pass="admin"
 app_cmd_override=""
+isolated_profile=0
 dry_run=0
 tail_lines=200
 app=""
@@ -256,6 +258,7 @@ if [[ "$action" == "start" ]]; then
       --user-pass) user_pass="${2:-}"; shift 2 ;;
       --admin-pass) admin_pass="${2:-}"; shift 2 ;;
       --app-cmd) app_cmd_override="${2:-}"; shift 2 ;;
+      --isolated-profile) isolated_profile=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) echo "ERROR: unknown option: $1" >&2; usage; exit 2 ;;
@@ -326,16 +329,28 @@ if [[ "$action" == "start" ]]; then
     app_cmd="$(default_app_command "$app")"
   fi
 
-  # Chromium-family browsers must use an isolated profile per runtime.
-  # Otherwise, if another browser instance is already running, Chromium prints
-  # "Opening in existing browser session" and exits without creating a window
-  # on this X display, leaving Neko with no visible app window.
+  browser_family=0
+  # Chromium-family browsers default to normal shared profile behavior so
+  # cookies/session state match what users expect from launching the app directly.
+  # Optional fallback: --isolated-profile for a per-runtime profile when needed.
   case "$app" in
     chromium|chromium-browser|google-chrome|chrome|brave|vivaldi|opera)
-      if [[ "$app_cmd" != *"--user-data-dir="* ]]; then
+      browser_family=1
+      if [[ "$app_cmd" != *"--new-window"* ]]; then
+        app_cmd="$app_cmd --new-window about:blank"
+      fi
+      if (( isolated_profile == 1 )) && [[ "$app_cmd" != *"--user-data-dir="* ]]; then
         app_profile_dir="$state_dir/browser-profile"
         mkdir -p "$app_profile_dir"
-        app_cmd="$app_cmd --user-data-dir=$app_profile_dir --new-window about:blank"
+        app_cmd="$app_cmd --user-data-dir=$app_profile_dir"
+      fi
+      if (( isolated_profile == 0 )) && [[ "$app_cmd" != *"--user-data-dir="* ]]; then
+        if pgrep -f '(chromium|chromium-browser|google-chrome|brave-browser|vivaldi|opera|/chrome )( |$)' >/dev/null 2>&1; then
+          cat >&2 <<'EOF'
+WARN: Existing browser processes detected. Shared-profile launch may attach to an existing session
+      instead of opening on this Neko display. If that happens, restart with --isolated-profile.
+EOF
+        fi
       fi
       ;;
   esac
@@ -405,6 +420,13 @@ EOF
   echo "Repo: $root"
   echo "Neko: $neko_bin"
   echo "App: $app"
+  if (( browser_family == 1 )); then
+    if (( isolated_profile == 1 )); then
+      echo "Browser profile mode: isolated"
+    else
+      echo "Browser profile mode: shared"
+    fi
+  fi
   echo "App command: $app_cmd"
   echo "State dir: $state_dir"
   echo "Display: $display (runtime: $runtime_display, transport: $X11_TRANSPORT)"
