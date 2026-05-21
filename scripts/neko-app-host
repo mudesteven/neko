@@ -23,7 +23,7 @@ Options (start):
   --name NAME          Runtime name (default: neko-host-<app>-<port>)
   --screen WxH@FPS     Neko desktop screen (default: 1920x1080@30)
   --display :N|auto    X display number for Xvfb (default: auto)
-  --nat-ip IP|auto     NAT1TO1 IP advertised to clients (default: auto)
+  --nat-ip IP|auto|off NAT1TO1 IP advertised to clients (default: off)
   --user-pass PASS     Member/user password (default: neko)
   --admin-pass PASS    Admin password (default: admin)
   --app-cmd CMD        Override app launch command (advanced)
@@ -226,7 +226,7 @@ port=18080
 udp_range="52000-52100"
 screen="1920x1080@30"
 display="auto"
-nat_ip="auto"
+nat_ip="off"
 user_pass="neko"
 admin_pass="admin"
 app_cmd_override=""
@@ -301,19 +301,44 @@ if [[ "$action" == "start" ]]; then
   local_ips=()
   collect_bind_ips local_ips
 
-  if [[ "$nat_ip" == "auto" ]]; then
-    if [[ ${#local_ips[@]} -gt 0 ]]; then
-      nat_ip="${local_ips[0]}"
-    else
+  case "$nat_ip" in
+    off|none|"")
       nat_ip=""
-    fi
-  fi
+      ;;
+    auto)
+      if [[ ${#local_ips[@]} -gt 0 ]]; then
+        nat_ip="${local_ips[0]}"
+      else
+        nat_ip=""
+      fi
+      ;;
+    *)
+      if ! [[ "$nat_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        echo "ERROR: invalid --nat-ip value: $nat_ip (use auto, off, or IPv4)" >&2
+        exit 2
+      fi
+      ;;
+  esac
 
   if [[ -n "$app_cmd_override" ]]; then
     app_cmd="$app_cmd_override"
   else
     app_cmd="$(default_app_command "$app")"
   fi
+
+  # Chromium-family browsers must use an isolated profile per runtime.
+  # Otherwise, if another browser instance is already running, Chromium prints
+  # "Opening in existing browser session" and exits without creating a window
+  # on this X display, leaving Neko with no visible app window.
+  case "$app" in
+    chromium|chromium-browser|google-chrome|chrome|brave|vivaldi|opera)
+      if [[ "$app_cmd" != *"--user-data-dir="* ]]; then
+        app_profile_dir="$state_dir/browser-profile"
+        mkdir -p "$app_profile_dir"
+        app_cmd="$app_cmd --user-data-dir=$app_profile_dir --new-window about:blank"
+      fi
+      ;;
+  esac
 
   runtime_display="$display"
   X11_TRANSPORT="unix"
@@ -393,7 +418,7 @@ EOF
     echo "  pulseaudio -nF $pulse_conf"
     echo "  openbox"
     echo "  $app_cmd"
-    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled=false --session.cookie.enabled=false --webrtc.epr $udp_start-$udp_end"
+    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled=false --session.cookie.enabled=false --webrtc.ip_retrieval_url '' --webrtc.epr $udp_start-$udp_end"
   else
     if [[ -f "$pid_file" ]]; then
       # shellcheck disable=SC1090
@@ -439,6 +464,7 @@ EOF
       "NEKO_DESKTOP_DISPLAY=$runtime_display"
       "NEKO_CAPTURE_VIDEO_DISPLAY=$runtime_display"
       "NEKO_SESSION_COOKIE_ENABLED=false"
+      "NEKO_WEBRTC_IP_RETRIEVAL_URL="
     )
     if [[ -n "$nat_ip" ]]; then
       NEKO_ENV+=("NEKO_WEBRTC_NAT1TO1=$nat_ip")
@@ -452,6 +478,7 @@ EOF
       --desktop.screen "$screen" \
       --desktop.input.enabled=false \
       --session.cookie.enabled=false \
+      --webrtc.ip_retrieval_url "" \
       --webrtc.epr "$udp_start-$udp_end" >"$neko_log" 2>&1 &
     NEKO_PID=$!
 
