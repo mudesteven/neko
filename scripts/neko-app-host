@@ -393,7 +393,7 @@ EOF
     echo "  pulseaudio -nF $pulse_conf"
     echo "  openbox"
     echo "  $app_cmd"
-    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled false --webrtc.epr $udp_start-$udp_end"
+    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $runtime_display --capture.video.display $runtime_display --desktop.screen $screen --desktop.input.enabled=false --webrtc.epr $udp_start-$udp_end"
   else
     if [[ -f "$pid_file" ]]; then
       # shellcheck disable=SC1090
@@ -449,7 +449,7 @@ EOF
       --desktop.display "$runtime_display" \
       --capture.video.display "$runtime_display" \
       --desktop.screen "$screen" \
-      --desktop.input.enabled false \
+      --desktop.input.enabled=false \
       --webrtc.epr "$udp_start-$udp_end" >"$neko_log" 2>&1 &
     NEKO_PID=$!
 
