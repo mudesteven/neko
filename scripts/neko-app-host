@@ -22,7 +22,7 @@ Options (start):
   --udp-range A-B      WebRTC UDP range (default: 52000-52100)
   --name NAME          Runtime name (default: neko-host-<app>-<port>)
   --screen WxH@FPS     Neko desktop screen (default: 1920x1080@30)
-  --display :N         X display number for Xvfb (default: :99)
+  --display :N|auto    X display number for Xvfb (default: auto)
   --nat-ip IP|auto     NAT1TO1 IP advertised to clients (default: auto)
   --user-pass PASS     Member/user password (default: neko)
   --admin-pass PASS    Admin password (default: admin)
@@ -84,10 +84,74 @@ collect_bind_ips() {
   out=("${uniq[@]}")
 }
 
+ensure_x11_socket_dir() {
+  local d="/tmp/.X11-unix"
+  mkdir -p "$d" 2>/dev/null || true
+  chmod 1777 "$d" 2>/dev/null || true
+  if [[ ! -w "$d" ]]; then
+    cat >&2 <<'EOF'
+ERROR: /tmp/.X11-unix is not writable by current user.
+Run once:
+  sudo mkdir -p /tmp/.X11-unix
+  sudo chmod 1777 /tmp/.X11-unix
+Then retry.
+EOF
+    exit 1
+  fi
+}
+
+pick_display() {
+  local n
+  for n in $(seq 99 140); do
+    if [[ ! -e "/tmp/.X${n}-lock" && ! -S "/tmp/.X11-unix/X${n}" ]]; then
+      echo ":${n}"
+      return 0
+    fi
+  done
+  echo ":99"
+}
+
+is_neko_repo_dir() {
+  local d="$1"
+  [[ -d "$d/server" && -d "$d/client" ]]
+}
+
 repo_root() {
-  local script_dir
+  local script_dir candidate git_root
+
+  # 1) explicit override
+  if [[ -n "${NEKO_APP_REPO:-}" ]] && is_neko_repo_dir "$NEKO_APP_REPO"; then
+    cd "$NEKO_APP_REPO" && pwd
+    return 0
+  fi
+
+  # 2) current working directory
+  if is_neko_repo_dir "$PWD"; then
+    cd "$PWD" && pwd
+    return 0
+  fi
+
+  # 3) git toplevel from cwd
+  if git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"; then
+    if [[ -n "$git_root" ]] && is_neko_repo_dir "$git_root"; then
+      cd "$git_root" && pwd
+      return 0
+    fi
+  fi
+
+  # 4) relative to script (works when running from repo checkout)
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  cd "$script_dir/.." && pwd
+  candidate="$(cd "$script_dir/.." && pwd)"
+  if is_neko_repo_dir "$candidate"; then
+    echo "$candidate"
+    return 0
+  fi
+
+  cat >&2 <<'EOF'
+ERROR: unable to locate Neko repository root.
+Run this command inside your cloned neko repo, or set NEKO_APP_REPO=/path/to/neko.
+EOF
+  exit 1
 }
 
 pid_is_alive() {
@@ -106,8 +170,24 @@ require_cmd() {
 default_app_command() {
   local app="$1"
   case "$app" in
-    firefox) echo "/usr/bin/firefox --no-remote -P default -width 1280 -height 720" ;;
-    chromium) echo "/usr/bin/chromium --no-sandbox --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage" ;;
+    firefox)
+      if have_cmd firefox; then
+        echo "$(command -v firefox) --no-remote -P default -width 1280 -height 720"
+      elif have_cmd firefox-esr; then
+        echo "$(command -v firefox-esr) --no-remote -P default -width 1280 -height 720"
+      else
+        echo "/usr/bin/firefox --no-remote -P default -width 1280 -height 720"
+      fi
+      ;;
+    chromium)
+      if have_cmd chromium; then
+        echo "$(command -v chromium) --no-sandbox --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage"
+      elif have_cmd chromium-browser; then
+        echo "$(command -v chromium-browser) --no-sandbox --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage"
+      else
+        echo "/usr/bin/chromium --no-sandbox --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer --disable-dev-shm-usage"
+      fi
+      ;;
     google-chrome|chrome) echo "/usr/bin/google-chrome --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer" ;;
     brave) echo "/usr/bin/brave-browser --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer" ;;
     vivaldi) echo "/usr/bin/vivaldi --no-first-run --start-maximized --disable-gpu --disable-software-rasterizer" ;;
@@ -138,7 +218,7 @@ name=""
 port=18080
 udp_range="52000-52100"
 screen="1920x1080@30"
-display=":99"
+display="auto"
 nat_ip="auto"
 user_pass="neko"
 admin_pass="admin"
@@ -187,6 +267,13 @@ if [[ "$action" == "start" ]]; then
     name="neko-host-${app}-${port}"
   fi
 
+  if [[ "$display" == "auto" ]]; then
+    display="$(pick_display)"
+  elif ! [[ "$display" =~ ^:[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "ERROR: invalid --display value: $display (use :99 or auto)" >&2
+    exit 2
+  fi
+
   IFS='-' read -r udp_start udp_end <<< "$udp_range"
   if (( udp_start < 1024 || udp_end > 65535 || udp_start > udp_end )); then
     echo "ERROR: invalid --udp-range bounds: $udp_range" >&2
@@ -196,6 +283,9 @@ if [[ "$action" == "start" ]]; then
   root="$(repo_root)"
   neko_bin="$root/server/bin/neko"
   static_dir="$root/client/build"
+  if [[ ! -d "$static_dir" && -d "$root/client/dist" ]]; then
+    static_dir="$root/client/dist"
+  fi
   run_root="$root/runs/host"
   state_dir="$run_root/$name"
   pid_file="$state_dir/pids.env"
@@ -222,6 +312,7 @@ if [[ "$action" == "start" ]]; then
     require_cmd Xvfb
     require_cmd openbox
     require_cmd pulseaudio
+    ensure_x11_socket_dir
     if [[ ! -x "$neko_bin" ]]; then
       cat >&2 <<EOF
 ERROR: missing neko binary: $neko_bin
@@ -241,7 +332,7 @@ EOF
 
     if [[ ! -d "$static_dir" ]]; then
       cat >&2 <<EOF
-ERROR: missing client build directory: $static_dir
+ERROR: missing client static directory (expected client/build or client/dist).
 Build it first:
   cd $root/client
   npm install
@@ -287,7 +378,7 @@ EOF
     echo "  pulseaudio -nF $pulse_conf"
     echo "  openbox"
     echo "  $app_cmd"
-    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $display --capture.video.display $display --desktop.screen $screen --webrtc.epr $udp_start-$udp_end"
+    echo "  $neko_bin serve --server.bind 0.0.0.0:$port --server.static $static_dir --desktop.display $display --capture.video.display $display --desktop.screen $screen --desktop.input.enabled false --webrtc.epr $udp_start-$udp_end"
   else
     if [[ -f "$pid_file" ]]; then
       # shellcheck disable=SC1090
@@ -329,11 +420,12 @@ EOF
       "NEKO_WEBRTC_EPR=$udp_start-$udp_end"
       "NEKO_WEBRTC_ICELITE=1"
       "NEKO_DESKTOP_SCREEN=$screen"
+      "NEKO_DESKTOP_INPUT_ENABLED=false"
       "NEKO_DESKTOP_DISPLAY=$display"
       "NEKO_CAPTURE_VIDEO_DISPLAY=$display"
     )
     if [[ -n "$nat_ip" ]]; then
-      NEKO_ENV+=("NEKO_WEBRTC_NAT1TO1=$nat_ip" "NEKO_NAT1TO1=$nat_ip")
+      NEKO_ENV+=("NEKO_WEBRTC_NAT1TO1=$nat_ip")
     fi
 
     env "${NEKO_ENV[@]}" "$neko_bin" serve \
@@ -342,6 +434,7 @@ EOF
       --desktop.display "$display" \
       --capture.video.display "$display" \
       --desktop.screen "$screen" \
+      --desktop.input.enabled false \
       --webrtc.epr "$udp_start-$udp_end" >"$neko_log" 2>&1 &
     NEKO_PID=$!
 
